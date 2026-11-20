@@ -277,51 +277,88 @@ static mp_obj_t list_pop(size_t n_args, const mp_obj_t *args) {
     return ret;
 }
 
-// "head" is actually the *exclusive lower bound* of the range to sort. That is,
-// the first element to be sorted is `head[1]`, not `head[0]`. Similarly `tail`
-// is an *inclusive upper bound* of the range to sort. That is, the final
-// element to sort is `tail[0]`, not `tail[-1]`.
-//
-// The pivot element is always chosen as `tail[0]`.
-//
-// These unusual choices allows structuring the partitioning
-// process as a do/while loop, which generates smaller code than the equivalent
-// code with usual C bounds & a while or for loop.
-static void mp_quicksort(mp_obj_t *head, mp_obj_t *tail, mp_obj_t key_fn, mp_obj_t binop_less_result) {
-    mp_cstack_check();
-    while (tail - head > 1) { // So long as at least 2 elements remain
-        mp_obj_t *h = head;
-        mp_obj_t *t = tail;
-        mp_obj_t v = key_fn == MP_OBJ_NULL ? tail[0] : mp_call_function_1(key_fn, tail[0]); // get pivot using key_fn
-        for (;;) {
-            do {++h;
-            } while (h < t && mp_binary_op(MP_BINARY_OP_LESS, key_fn == MP_OBJ_NULL ? h[0] : mp_call_function_1(key_fn, h[0]), v) == binop_less_result);
-            do {--t;
-            } while (h < t && mp_binary_op(MP_BINARY_OP_LESS, v, key_fn == MP_OBJ_NULL ? t[0] : mp_call_function_1(key_fn, t[0])) == binop_less_result);
-            if (h >= t) {
-                break;
-            }
-            // A pair of objects must be swapped to the other side of the partition
-            mp_obj_t x = h[0];
-            h[0] = t[0];
-            t[0] = x;
+// Stable in-place merge sort, as in Go's sort.Stable: bottom-up passes merge
+// adjacent runs of width 1, 2, 4, ... with SymMerge (Kim & Kutzner, "Stable
+// minimum storage merging by symmetric comparisons", 2004).  This takes
+// O(n log n) comparisons and O(n log^2 n) moves, and allocates no memory.
+// Items are only moved by rotations, never held in a temporary while a
+// comparison is made, so if a comparison raises the list still holds every
+// item.
+
+typedef struct _sort_ctx_t {
+    mp_obj_t key_fn;
+    bool reverse;
+} sort_ctx_t;
+
+// Returns a < b, or b < a if reversed, so that equal items keep their order.
+static bool sort_less(const sort_ctx_t *ctx, mp_obj_t a, mp_obj_t b) {
+    if (ctx->key_fn != MP_OBJ_NULL) {
+        a = mp_call_function_1(ctx->key_fn, a);
+        b = mp_call_function_1(ctx->key_fn, b);
+    }
+    if (ctx->reverse) {
+        mp_obj_t t = a;
+        a = b;
+        b = t;
+    }
+    return mp_binary_op(MP_BINARY_OP_LESS, a, b) == mp_const_true;
+}
+
+// Reverses the items in [a, b).
+static void list_reverse_range(mp_obj_t *a, mp_obj_t *b) {
+    while (b - a > 1) {
+        mp_obj_t t = *a;
+        --b;
+        *a++ = *b;
+        *b = t;
+    }
+}
+
+// Merges the sorted runs [a, m) and [m, b) in place.  Split [a, b) at its
+// midpoint and find, by binary search, the cut [lo, end) around m such that
+// rotating [lo, m) with [m, end) puts every item in the half it belongs to.
+// Then merge each half on its own: the first half by recursion and the
+// second by looping.  The recursive call gets at most half of [a, b), so
+// recursion is at most log2(n) deep and stack use is O(log n).
+static void sort_merge(mp_obj_t *a, mp_obj_t *m, mp_obj_t *b, const sort_ctx_t *ctx) {
+    while (a < m && m < b) {
+        mp_cstack_check();
+        mp_obj_t *mid = a + (b - a) / 2;
+        // Binary search [lo, hi) for the cut, comparing each c with its
+        // mirror image about the centre of [a, b), m + (mid - c) - 1.
+        mp_obj_t *lo = a;
+        mp_obj_t *hi = m;
+        if (m > mid) {
+            lo = m - (b - mid);
+            hi = mid;
         }
-        // Place the pivot element in the proper position
-        mp_obj_t x = h[0];
-        h[0] = tail[0];
-        tail[0] = x;
-        // do the smaller recursive call first, to keep stack within O(log(N))
-        if (t - head < tail - h) {
-            mp_quicksort(head, t, key_fn, binop_less_result);
-            head = h;
-        } else {
-            mp_quicksort(h, tail, key_fn, binop_less_result);
-            tail = t;
+        while (lo < hi) {
+            mp_obj_t *c = lo + (hi - lo) / 2;
+            if (sort_less(ctx, m[mid - c - 1], *c)) {
+                hi = c;
+            } else {
+                lo = c + 1;
+            }
+        }
+        mp_obj_t *end = m + (mid - lo);
+        list_reverse_range(lo, m);
+        list_reverse_range(m, end);
+        list_reverse_range(lo, end);
+        sort_merge(a, lo, mid, ctx);
+        a = mid;
+        m = end;
+    }
+}
+
+// Sorts n items at base: merges pairs of runs of width 1, then 2, 4, ...
+static void mp_sort(mp_obj_t *base, size_t n, const sort_ctx_t *ctx) {
+    for (size_t w = 1; w < n; w *= 2) {
+        for (size_t i = 0; i + w < n; i += 2 * w) {
+            sort_merge(base + i, base + i + w, base + MIN(i + 2 * w, n), ctx);
         }
     }
 }
 
-// TODO Python defines sort to be stable but ours is not
 mp_obj_t mp_obj_list_sort(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_key, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_rom_obj = MP_ROM_NONE} },
@@ -339,9 +376,11 @@ mp_obj_t mp_obj_list_sort(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     mp_obj_list_t *self = MP_OBJ_TO_PTR(pos_args[0]);
 
     if (self->len > 1) {
-        mp_quicksort(self->items - 1, self->items + self->len - 1,
+        sort_ctx_t ctx = {
             args.key.u_obj == mp_const_none ? MP_OBJ_NULL : args.key.u_obj,
-            args.reverse.u_bool ? mp_const_false : mp_const_true);
+            args.reverse.u_bool,
+        };
+        mp_sort(self->items, self->len, &ctx);
     }
 
     return mp_const_none;
@@ -413,13 +452,7 @@ static mp_obj_t list_reverse(mp_obj_t self_in) {
     mp_check_self(mp_obj_is_type(self_in, &mp_type_list));
     mp_obj_list_t *self = MP_OBJ_TO_PTR(self_in);
 
-    mp_int_t len = self->len;
-    for (mp_int_t i = 0; i < len / 2; i++) {
-        mp_obj_t a = self->items[i];
-        self->items[i] = self->items[len - i - 1];
-        self->items[len - i - 1] = a;
-    }
-
+    list_reverse_range(self->items, self->items + self->len);
     return mp_const_none;
 }
 
