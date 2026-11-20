@@ -363,15 +363,16 @@ static void list_merge(mp_obj_t *lo, mp_obj_t *mid, mp_obj_t *hi, const mp_arg_v
 // in a local while the sorted items before it are binary searched for the
 // first one it sorts before, so the list is unchanged while key and __lt__
 // run; then it is stored there and the items after it are moved up one
-// place.  The search probes the previous item first, so sorted input takes
-// n - 1 comparisons.  This makes O(n log n) comparisons but O(n^2) moves.
+// place.  The search first probes where the previous item was stored (m is
+// left there by the search), so sorted and reversed input take n - 1
+// comparisons.  This makes O(n log n) comparisons but O(n^2) moves.
 static void list_sort_items(mp_obj_t *items, size_t n, const mp_arg_val_t *args) {
+    size_t m = 0;
     for (size_t i = 1; i < n; i++) {
         mp_obj_t x = items[i];
         mp_obj_t kx = list_sort_key(x, args);
         size_t lo = 0;
         size_t hi = i;
-        size_t m = i - 1;
         while (lo < hi) {
             if (list_sort_lt(kx, list_sort_key(items[m], args), args)) {
                 hi = m;
