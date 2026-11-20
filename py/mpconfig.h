@@ -715,6 +715,13 @@ typedef uint64_t mp_uint_t;
 #endif
 
 
+// Whether list.sort() checks if two sorted halves are already in order before
+// merging them, which makes sorting sorted or nearly sorted lists about 3x
+// faster.  Increases Thumb2 code size by about 46 bytes.
+#ifndef MICROPY_OPT_LIST_SORT_ORDERED_CHECK
+#define MICROPY_OPT_LIST_SORT_ORDERED_CHECK (MICROPY_CONFIG_ROM_LEVEL_AT_LEAST_EXTRA_FEATURES)
+#endif
+
 // Whether math.factorial is large, fast and recursive (1) or small and slow (0).
 #ifndef MICROPY_OPT_MATH_FACTORIAL
 #define MICROPY_OPT_MATH_FACTORIAL (MICROPY_CONFIG_ROM_LEVEL_AT_LEAST_EXTRA_FEATURES)
