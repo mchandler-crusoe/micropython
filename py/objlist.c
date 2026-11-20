@@ -277,51 +277,83 @@ static mp_obj_t list_pop(size_t n_args, const mp_obj_t *args) {
     return ret;
 }
 
-// "head" is actually the *exclusive lower bound* of the range to sort. That is,
-// the first element to be sorted is `head[1]`, not `head[0]`. Similarly `tail`
-// is an *inclusive upper bound* of the range to sort. That is, the final
-// element to sort is `tail[0]`, not `tail[-1]`.
+// Reverse the items in [lo, hi).
+static void list_reverse_range(mp_obj_t *lo, mp_obj_t *hi) {
+    while (lo < --hi) {
+        mp_obj_t x = *lo;
+        *lo++ = *hi;
+        *hi = x;
+    }
+}
+
+// Return true if a must sort strictly before b.  args holds the key and
+// reverse arguments of sort().  Swapping a and b for reverse (rather than
+// negating the result) keeps the sort stable when reversed.
+static bool list_sort_lt(mp_obj_t a, mp_obj_t b, const mp_arg_val_t *args) {
+    mp_obj_t key_fn = args[0].u_obj;
+    if (key_fn != mp_const_none) {
+        a = mp_call_function_1(key_fn, a);
+        b = mp_call_function_1(key_fn, b);
+    }
+    if (args[1].u_bool) {
+        mp_obj_t x = a;
+        a = b;
+        b = x;
+    }
+    return mp_binary_op(MP_BINARY_OP_LESS, a, b) == mp_const_true;
+}
+
+// Stably merge the sorted runs [lo, mid) and [mid, hi) in place, without a
+// buffer, or if mid is NULL then stably sort [lo, hi) by sorting each half
+// and merging them (a top-down merge sort, nesting log2(hi - lo) deep).
 //
-// The pivot element is always chosen as `tail[0]`.
-//
-// These unusual choices allows structuring the partitioning
-// process as a do/while loop, which generates smaller code than the equivalent
-// code with usual C bounds & a while or for loop.
-static void mp_quicksort(mp_obj_t *head, mp_obj_t *tail, mp_obj_t key_fn, mp_obj_t binop_less_result) {
+// To merge, the middle item p of the left run is the pivot: the right run is
+// binary searched for the first item not less than p, and the right-run items
+// before that are rotated to just before p.  That puts p in its final place
+// and leaves two smaller, independent merges either side of it.  The smaller
+// one is done by recursion and the larger by looping, so each nested merge
+// has fewer than half as many items as its caller and nests at most
+// log2(hi - lo) deep.  The C stack depth is therefore O(log n).
+static void list_merge(mp_obj_t *lo, mp_obj_t *mid, mp_obj_t *hi, const mp_arg_val_t *args) {
     mp_cstack_check();
-    while (tail - head > 1) { // So long as at least 2 elements remain
-        mp_obj_t *h = head;
-        mp_obj_t *t = tail;
-        mp_obj_t v = key_fn == MP_OBJ_NULL ? tail[0] : mp_call_function_1(key_fn, tail[0]); // get pivot using key_fn
-        for (;;) {
-            do {++h;
-            } while (h < t && mp_binary_op(MP_BINARY_OP_LESS, key_fn == MP_OBJ_NULL ? h[0] : mp_call_function_1(key_fn, h[0]), v) == binop_less_result);
-            do {--t;
-            } while (h < t && mp_binary_op(MP_BINARY_OP_LESS, v, key_fn == MP_OBJ_NULL ? t[0] : mp_call_function_1(key_fn, t[0])) == binop_less_result);
-            if (h >= t) {
-                break;
-            }
-            // A pair of objects must be swapped to the other side of the partition
-            mp_obj_t x = h[0];
-            h[0] = t[0];
-            t[0] = x;
+    if (mid == NULL) {
+        // sort [lo, hi): sort each half then merge them
+        if (hi - lo < 2) {
+            return;
         }
-        // Place the pivot element in the proper position
-        mp_obj_t x = h[0];
-        h[0] = tail[0];
-        tail[0] = x;
-        // do the smaller recursive call first, to keep stack within O(log(N))
-        if (t - head < tail - h) {
-            mp_quicksort(head, t, key_fn, binop_less_result);
-            head = h;
+        mid = lo + (hi - lo) / 2;
+        list_merge(lo, NULL, mid, args);
+        list_merge(mid, NULL, hi, args);
+    }
+    while (lo < mid && mid < hi) {
+        mp_obj_t *p = lo + (mid - lo) / 2;
+        mp_obj_t *b = mid;
+        mp_obj_t *e = hi;
+        while (b < e) {
+            mp_obj_t *m = b + (e - b) / 2;
+            if (list_sort_lt(*m, *p, args)) {
+                b = m + 1;
+            } else {
+                e = m;
+            }
+        }
+        // rotate [p, mid) and [mid, b), moving p to q
+        list_reverse_range(p, mid);
+        list_reverse_range(mid, b);
+        list_reverse_range(p, b);
+        mp_obj_t *q = p + (b - mid);
+        if (q - lo < hi - q) {
+            list_merge(lo, p, q, args);
+            lo = q + 1;
+            mid = b;
         } else {
-            mp_quicksort(h, tail, key_fn, binop_less_result);
-            tail = t;
+            list_merge(q + 1, b, hi, args);
+            mid = p;
+            hi = q;
         }
     }
 }
 
-// TODO Python defines sort to be stable but ours is not
 mp_obj_t mp_obj_list_sort(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_key, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_rom_obj = MP_ROM_NONE} },
@@ -329,20 +361,14 @@ mp_obj_t mp_obj_list_sort(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     };
 
     // parse args
-    struct {
-        mp_arg_val_t key, reverse;
-    } args;
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
     mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args,
-        MP_ARRAY_SIZE(allowed_args), allowed_args, (mp_arg_val_t *)&args);
+        MP_ARRAY_SIZE(allowed_args), allowed_args, args);
 
     mp_check_self(mp_obj_is_type(pos_args[0], &mp_type_list));
     mp_obj_list_t *self = MP_OBJ_TO_PTR(pos_args[0]);
 
-    if (self->len > 1) {
-        mp_quicksort(self->items - 1, self->items + self->len - 1,
-            args.key.u_obj == mp_const_none ? MP_OBJ_NULL : args.key.u_obj,
-            args.reverse.u_bool ? mp_const_false : mp_const_true);
-    }
+    list_merge(self->items, NULL, self->items + self->len, args);
 
     return mp_const_none;
 }
@@ -413,12 +439,7 @@ static mp_obj_t list_reverse(mp_obj_t self_in) {
     mp_check_self(mp_obj_is_type(self_in, &mp_type_list));
     mp_obj_list_t *self = MP_OBJ_TO_PTR(self_in);
 
-    mp_int_t len = self->len;
-    for (mp_int_t i = 0; i < len / 2; i++) {
-        mp_obj_t a = self->items[i];
-        self->items[i] = self->items[len - i - 1];
-        self->items[len - i - 1] = a;
-    }
+    list_reverse_range(self->items, self->items + self->len);
 
     return mp_const_none;
 }
