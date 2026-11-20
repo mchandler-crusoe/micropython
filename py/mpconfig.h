@@ -715,6 +715,14 @@ typedef uint64_t mp_uint_t;
 #endif
 
 
+// Whether list.sort() merges through a temporary buffer of len/2 items (1),
+// falling back to merging in place if it can't be allocated, or always
+// merges in place (0), which is slower.  Increases Thumb2 code size by
+// about 350 bytes.
+#ifndef MICROPY_OPT_LIST_SORT_BUFFER
+#define MICROPY_OPT_LIST_SORT_BUFFER (MICROPY_CONFIG_ROM_LEVEL_AT_LEAST_EXTRA_FEATURES)
+#endif
+
 // Whether math.factorial is large, fast and recursive (1) or small and slow (0).
 #ifndef MICROPY_OPT_MATH_FACTORIAL
 #define MICROPY_OPT_MATH_FACTORIAL (MICROPY_CONFIG_ROM_LEVEL_AT_LEAST_EXTRA_FEATURES)

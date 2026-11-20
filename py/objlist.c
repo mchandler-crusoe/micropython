@@ -277,51 +277,189 @@ static mp_obj_t list_pop(size_t n_args, const mp_obj_t *args) {
     return ret;
 }
 
-// "head" is actually the *exclusive lower bound* of the range to sort. That is,
-// the first element to be sorted is `head[1]`, not `head[0]`. Similarly `tail`
-// is an *inclusive upper bound* of the range to sort. That is, the final
-// element to sort is `tail[0]`, not `tail[-1]`.
-//
-// The pivot element is always chosen as `tail[0]`.
-//
-// These unusual choices allows structuring the partitioning
-// process as a do/while loop, which generates smaller code than the equivalent
-// code with usual C bounds & a while or for loop.
-static void mp_quicksort(mp_obj_t *head, mp_obj_t *tail, mp_obj_t key_fn, mp_obj_t binop_less_result) {
-    mp_cstack_check();
-    while (tail - head > 1) { // So long as at least 2 elements remain
-        mp_obj_t *h = head;
-        mp_obj_t *t = tail;
-        mp_obj_t v = key_fn == MP_OBJ_NULL ? tail[0] : mp_call_function_1(key_fn, tail[0]); // get pivot using key_fn
-        for (;;) {
-            do {++h;
-            } while (h < t && mp_binary_op(MP_BINARY_OP_LESS, key_fn == MP_OBJ_NULL ? h[0] : mp_call_function_1(key_fn, h[0]), v) == binop_less_result);
-            do {--t;
-            } while (h < t && mp_binary_op(MP_BINARY_OP_LESS, v, key_fn == MP_OBJ_NULL ? t[0] : mp_call_function_1(key_fn, t[0])) == binop_less_result);
-            if (h >= t) {
-                break;
-            }
-            // A pair of objects must be swapped to the other side of the partition
-            mp_obj_t x = h[0];
-            h[0] = t[0];
-            t[0] = x;
-        }
-        // Place the pivot element in the proper position
-        mp_obj_t x = h[0];
-        h[0] = tail[0];
-        tail[0] = x;
-        // do the smaller recursive call first, to keep stack within O(log(N))
-        if (t - head < tail - h) {
-            mp_quicksort(head, t, key_fn, binop_less_result);
-            head = h;
+// list.sort() is a stable merge sort.  mp_sort_rec halves the range at each
+// level, so it recurses at most log2(n) deep.  A merge either goes through
+// a temporary buffer of n/2 items, without recursion, or (if the buffer is
+// disabled or can't be allocated) cuts the two runs, rotates the middle and
+// recurses only into the smaller of the two resulting merges, looping on
+// the larger, so each recursion at least halves the length and that depth
+// is also at most log2(n).  The C stack use is therefore O(log n).
+
+typedef struct _mp_sort_t {
+    #if MICROPY_OPT_LIST_SORT_BUFFER
+    nlr_jump_callback_node_t callback;
+    // Buffer of buf_len items, enough for the left run of every merge.
+    mp_obj_t *buf;
+    size_t buf_len;
+    // During a buffered merge the items cur..end are held only in the
+    // buffer, and they belong in the list just before right, the start of
+    // the unmerged part of the right run.
+    mp_obj_t *cur;
+    mp_obj_t *end;
+    mp_obj_t *right;
+    #endif
+    mp_obj_t key_fn;
+    bool reverse;
+} mp_sort_t;
+
+static mp_obj_t mp_sort_key(mp_sort_t *s, mp_obj_t x) {
+    return s->key_fn == MP_OBJ_NULL ? x : mp_call_function_1(s->key_fn, x);
+}
+
+// Whether the item with key x goes strictly before the one with key y.  For
+// reverse=True the arguments are swapped (rather than negating the result)
+// so that the sort stays stable.
+static bool mp_sort_lt(mp_sort_t *s, mp_obj_t x, mp_obj_t y) {
+    if (s->reverse) {
+        mp_obj_t t = x;
+        x = y;
+        y = t;
+    }
+    return mp_binary_op(MP_BINARY_OP_LESS, x, y) == mp_const_true;
+}
+
+// Whether item x goes strictly before item y.
+static bool mp_sort_less(mp_sort_t *s, mp_obj_t x, mp_obj_t y) {
+    return mp_sort_lt(s, mp_sort_key(s, x), mp_sort_key(s, y));
+}
+
+#if MICROPY_OPT_LIST_SORT_BUFFER
+// Runs up to this length are insertion sorted.
+#define MP_SORT_INSERTION_MAX (8)
+
+// Put the items held only in the buffer back in the list.  Called when a
+// merge completes, and also if a comparison raises, so that the list never
+// loses any of its items.
+static void mp_sort_flush(mp_sort_t *s) {
+    size_t n = s->end - s->cur;
+    memcpy(s->right - n, s->cur, n * sizeof(mp_obj_t));
+    s->cur = s->end;
+}
+
+static void mp_sort_done(void *ctx) {
+    mp_sort_t *s = ctx;
+    mp_sort_flush(s);
+    m_del(mp_obj_t, s->buf, s->buf_len);
+}
+#endif
+
+// The number of items at the start of the sorted a[0..n) that are less
+// than v.
+static size_t mp_sort_bound(mp_sort_t *s, mp_obj_t *a, size_t n, mp_obj_t v) {
+    size_t lo = 0;
+    while (n > 0) {
+        size_t half = n / 2;
+        if (mp_sort_less(s, a[lo + half], v)) {
+            lo += half + 1;
+            n -= half + 1;
         } else {
-            mp_quicksort(h, tail, key_fn, binop_less_result);
-            tail = t;
+            n = half;
+        }
+    }
+    return lo;
+}
+
+static void mp_sort_reverse(mp_obj_t *lo, mp_obj_t *hi) {
+    while (lo < --hi) {
+        mp_obj_t t = *lo;
+        *lo++ = *hi;
+        *hi = t;
+    }
+}
+
+// Merge the sorted runs a[0..n1) and a[n1..n1+n2).
+static void mp_sort_merge(mp_sort_t *s, mp_obj_t *a, size_t n1, size_t n2) {
+    mp_cstack_check();
+    while (n1 != 0 && n2 != 0) {
+        mp_obj_t *m = a + n1;
+        if (!mp_sort_less(s, m[0], m[-1])) {
+            // already in order
+            return;
+        }
+        #if MICROPY_OPT_LIST_SORT_BUFFER
+        if (n1 <= s->buf_len) {
+            // Move the left run to the buffer and merge back into the list.
+            // The list slots before m are free for the buffered items.
+            mp_obj_t *cur = s->buf;
+            mp_obj_t *end = cur + n1;
+            mp_obj_t *end2 = m + n2;
+            memcpy(cur, a, n1 * sizeof(mp_obj_t));
+            s->end = end;
+            s->cur = cur;
+            s->right = m;
+            // Each item's key is computed once per merge.
+            mp_obj_t kc = mp_sort_key(s, *cur);
+            mp_obj_t km = mp_sort_key(s, *m);
+            for (;;) {
+                bool take_m = mp_sort_lt(s, km, kc);
+                *a++ = take_m ? *m++ : *cur++;
+                s->cur = cur;
+                s->right = m;
+                if (cur == end || m == end2) {
+                    break;
+                }
+                if (take_m) {
+                    km = mp_sort_key(s, *m);
+                } else {
+                    kc = mp_sort_key(s, *cur);
+                }
+            }
+            mp_sort_flush(s);
+            return;
+        }
+        #endif
+        // Without a buffer: split the left run in half, find where its
+        // middle item goes in the right run, and rotate so that the first
+        // parts of both runs come before the second parts.  Swaps never
+        // lose items.
+        size_t c1 = n1 / 2;
+        size_t c2 = mp_sort_bound(s, m, n2, a[c1]);
+        mp_sort_reverse(a + c1, m);
+        mp_sort_reverse(m, m + c2);
+        mp_sort_reverse(a + c1, m + c2);
+        // Now merge a[0..c1) with the next c2 items, and the rest; recurse
+        // on the shorter of the two and loop on the other.
+        mp_obj_t *b = a + c1 + c2;
+        n1 -= c1;
+        n2 -= c2;
+        if (c1 + c2 < n1 + n2) {
+            mp_sort_merge(s, a, c1, c2);
+            a = b;
+        } else {
+            mp_sort_merge(s, b, n1, n2);
+            n1 = c1;
+            n2 = c2;
         }
     }
 }
 
-// TODO Python defines sort to be stable but ours is not
+static void mp_sort_rec(mp_sort_t *s, mp_obj_t *a, size_t n) {
+    #if MICROPY_OPT_LIST_SORT_BUFFER
+    if (n <= MP_SORT_INSERTION_MAX) {
+        // Insertion sort for short runs.  x stays in the list until all the
+        // comparisons for it are done.
+        for (size_t i = 1; i < n; ++i) {
+            mp_obj_t x = a[i];
+            mp_obj_t k = mp_sort_key(s, x);
+            size_t j = i;
+            while (j > 0 && mp_sort_lt(s, k, mp_sort_key(s, a[j - 1]))) {
+                --j;
+            }
+            memmove(a + j + 1, a + j, (i - j) * sizeof(mp_obj_t));
+            a[j] = x;
+        }
+        return;
+    }
+    #endif
+    if (n > 1) {
+        mp_cstack_check();
+        size_t n1 = n / 2;
+        mp_sort_rec(s, a, n1);
+        mp_sort_rec(s, a + n1, n - n1);
+        mp_sort_merge(s, a, n1, n - n1);
+    }
+}
+
 mp_obj_t mp_obj_list_sort(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_key, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_rom_obj = MP_ROM_NONE} },
@@ -339,9 +477,24 @@ mp_obj_t mp_obj_list_sort(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     mp_obj_list_t *self = MP_OBJ_TO_PTR(pos_args[0]);
 
     if (self->len > 1) {
-        mp_quicksort(self->items - 1, self->items + self->len - 1,
-            args.key.u_obj == mp_const_none ? MP_OBJ_NULL : args.key.u_obj,
-            args.reverse.u_bool ? mp_const_false : mp_const_true);
+        mp_sort_t s;
+        s.key_fn = args.key.u_obj == mp_const_none ? MP_OBJ_NULL : args.key.u_obj;
+        s.reverse = args.reverse.u_bool;
+        #if MICROPY_OPT_LIST_SORT_BUFFER
+        // The left run of a merge has at most len / 2 items.  If there is no
+        // memory for the buffer, merge in place instead (more slowly).
+        s.buf_len = self->len / 2;
+        s.buf = m_new_maybe(mp_obj_t, s.buf_len);
+        if (s.buf == NULL) {
+            s.buf_len = 0;
+        }
+        s.cur = s.end = s.right = NULL;
+        nlr_push_jump_callback(&s.callback, mp_sort_done);
+        #endif
+        mp_sort_rec(&s, self->items, self->len);
+        #if MICROPY_OPT_LIST_SORT_BUFFER
+        nlr_pop_jump_callback(true);
+        #endif
     }
 
     return mp_const_none;
