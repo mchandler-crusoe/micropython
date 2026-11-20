@@ -277,51 +277,121 @@ static mp_obj_t list_pop(size_t n_args, const mp_obj_t *args) {
     return ret;
 }
 
-// "head" is actually the *exclusive lower bound* of the range to sort. That is,
-// the first element to be sorted is `head[1]`, not `head[0]`. Similarly `tail`
-// is an *inclusive upper bound* of the range to sort. That is, the final
-// element to sort is `tail[0]`, not `tail[-1]`.
+// list.sort() is a stable, in-place natural merge sort.
 //
-// The pivot element is always chosen as `tail[0]`.
+// The list is split into natural runs: non-descending ones, and strictly
+// descending ones which are reversed in place (being strict, this keeps the
+// sort stable).  Runs are merged in a balanced binary pattern by sort_runs(),
+// and sort_merge() merges two runs without a buffer by rotating items into
+// place.  So already sorted or reversed input takes n - 1 comparisons, and
+// otherwise a sort takes O(n log n) comparisons and O(n log^2 n) moves.
 //
-// These unusual choices allows structuring the partitioning
-// process as a do/while loop, which generates smaller code than the equivalent
-// code with usual C bounds & a while or for loop.
-static void mp_quicksort(mp_obj_t *head, mp_obj_t *tail, mp_obj_t key_fn, mp_obj_t binop_less_result) {
-    mp_cstack_check();
-    while (tail - head > 1) { // So long as at least 2 elements remain
-        mp_obj_t *h = head;
-        mp_obj_t *t = tail;
-        mp_obj_t v = key_fn == MP_OBJ_NULL ? tail[0] : mp_call_function_1(key_fn, tail[0]); // get pivot using key_fn
-        for (;;) {
-            do {++h;
-            } while (h < t && mp_binary_op(MP_BINARY_OP_LESS, key_fn == MP_OBJ_NULL ? h[0] : mp_call_function_1(key_fn, h[0]), v) == binop_less_result);
-            do {--t;
-            } while (h < t && mp_binary_op(MP_BINARY_OP_LESS, v, key_fn == MP_OBJ_NULL ? t[0] : mp_call_function_1(key_fn, t[0])) == binop_less_result);
-            if (h >= t) {
-                break;
-            }
-            // A pair of objects must be swapped to the other side of the partition
-            mp_obj_t x = h[0];
-            h[0] = t[0];
-            t[0] = x;
-        }
-        // Place the pivot element in the proper position
-        mp_obj_t x = h[0];
-        h[0] = tail[0];
-        tail[0] = x;
-        // do the smaller recursive call first, to keep stack within O(log(N))
-        if (t - head < tail - h) {
-            mp_quicksort(head, t, key_fn, binop_less_result);
-            head = h;
-        } else {
-            mp_quicksort(h, tail, key_fn, binop_less_result);
-            tail = t;
-        }
+// Items are only ever swapped, so if a comparison or the key function raises
+// then the list still holds every original item.
+//
+// C stack usage is O(log n): sort_runs() recurses at most log2(n) + 1 deep
+// (see below), and sort_merge() recurses only into a merge whose left range is
+// at most half as long, so at most log2(n) deep.
+
+typedef struct _sort_t {
+    mp_obj_t key_fn;
+    bool reverse;
+    mp_obj_t *end;
+} sort_t;
+
+static mp_obj_t sort_key(const sort_t *s, mp_obj_t x) {
+    return s->key_fn == MP_OBJ_NULL ? x : mp_call_function_1(s->key_fn, x);
+}
+
+// Compare two keys.  For reverse the operands are swapped, rather than the
+// result negated, so that equal items still keep their original order.
+static bool sort_lt_keys(const sort_t *s, mp_obj_t a, mp_obj_t b) {
+    if (s->reverse) {
+        mp_obj_t t = a;
+        a = b;
+        b = t;
+    }
+    return mp_binary_op(MP_BINARY_OP_LESS, a, b) == mp_const_true;
+}
+
+static bool sort_lt(const sort_t *s, mp_obj_t a, mp_obj_t b) {
+    return sort_lt_keys(s, sort_key(s, a), sort_key(s, b));
+}
+
+#if MICROPY_OPT_SORT_PIVOT_KEY
+// Compute the key of the merge pivot once for its whole binary search.
+#define sort_pivot(s, x) sort_key(s, x)
+#define sort_lt_pivot(s, x, v) sort_lt_keys(s, sort_key(s, x), v)
+#else
+#define sort_pivot(s, x) (x)
+#define sort_lt_pivot(s, x, v) sort_lt(s, x, v)
+#endif
+
+static void sort_reverse(mp_obj_t *lo, mp_obj_t *hi) {
+    while (lo < --hi) {
+        mp_obj_t t = *lo;
+        *lo++ = *hi;
+        *hi = t;
     }
 }
 
-// TODO Python defines sort to be stable but ours is not
+// Merge the sorted ranges [a, m) and [m, b) in place.
+static void sort_merge(const sort_t *s, mp_obj_t *a, mp_obj_t *m, mp_obj_t *b) {
+    mp_cstack_check();
+    while (a < m && m < b) {
+        // Take the middle item of the left range as the pivot and binary search
+        // the right range for the first item not less than it.
+        mp_obj_t *p = a + (m - a) / 2;
+        mp_obj_t v = sort_pivot(s, *p);
+        mp_obj_t *lo = m;
+        mp_obj_t *hi = b;
+        while (lo < hi) {
+            mp_obj_t *mid = lo + (hi - lo) / 2;
+            if (sort_lt_pivot(s, *mid, v)) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        // Rotate [p, m) and [m, lo) to put the pivot in its final place at nm.
+        sort_reverse(p, m);
+        sort_reverse(m, lo);
+        sort_reverse(p, lo);
+        mp_obj_t *nm = p + (lo - m);
+        // Merge the items before the pivot, whose left range is [a, p), half
+        // as long as before, then loop to merge the items after it.
+        if (a < p && p < nm) {
+            sort_merge(s, a, p, nm);
+        }
+        a = nm + 1;
+        m = nm + (m - p);
+    }
+}
+
+// Find the natural run starting at a, then merge onto it the following
+// 2^0, 2^1, ..., 2^(depth - 1) runs, each group sorted by a recursive call.
+// Return the end of the sorted range.  A call at depth d sorts at most 2^d
+// runs, so the top-level call never passes more than log2(n) + 1 down.
+static mp_obj_t *sort_runs(const sort_t *s, mp_obj_t *a, size_t depth) {
+    mp_cstack_check();
+    mp_obj_t *end = s->end;
+    mp_obj_t *b = a + 1;
+    if (b < end) {
+        bool desc = sort_lt(s, *b, *a);
+        while (++b < end && sort_lt(s, *b, b[-1]) == desc) {
+        }
+        if (desc) {
+            sort_reverse(a, b);
+        }
+    }
+    for (size_t d = 0; d < depth && b < end; ++d) {
+        mp_obj_t *c = sort_runs(s, b, d);
+        sort_merge(s, a, b, c);
+        b = c;
+    }
+    return b;
+}
+
 mp_obj_t mp_obj_list_sort(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_key, MP_ARG_KW_ONLY | MP_ARG_OBJ, {.u_rom_obj = MP_ROM_NONE} },
@@ -339,9 +409,12 @@ mp_obj_t mp_obj_list_sort(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_
     mp_obj_list_t *self = MP_OBJ_TO_PTR(pos_args[0]);
 
     if (self->len > 1) {
-        mp_quicksort(self->items - 1, self->items + self->len - 1,
+        sort_t s = {
             args.key.u_obj == mp_const_none ? MP_OBJ_NULL : args.key.u_obj,
-            args.reverse.u_bool ? mp_const_false : mp_const_true);
+            args.reverse.u_bool,
+            self->items + self->len,
+        };
+        sort_runs(&s, self->items, (size_t)-1);
     }
 
     return mp_const_none;

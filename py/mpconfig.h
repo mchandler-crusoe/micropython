@@ -715,6 +715,13 @@ typedef uint64_t mp_uint_t;
 #endif
 
 
+// Whether list.sort() computes the key of each merge pivot once per binary
+// search rather than at each comparison.  This makes about 25% fewer calls to
+// the key function.  Increases Thumb2 code size by about 34 bytes.
+#ifndef MICROPY_OPT_SORT_PIVOT_KEY
+#define MICROPY_OPT_SORT_PIVOT_KEY (MICROPY_CONFIG_ROM_LEVEL_AT_LEAST_EXTRA_FEATURES)
+#endif
+
 // Whether math.factorial is large, fast and recursive (1) or small and slow (0).
 #ifndef MICROPY_OPT_MATH_FACTORIAL
 #define MICROPY_OPT_MATH_FACTORIAL (MICROPY_CONFIG_ROM_LEVEL_AT_LEAST_EXTRA_FEATURES)
