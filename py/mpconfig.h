@@ -715,6 +715,21 @@ typedef uint64_t mp_uint_t;
 #endif
 
 
+// Whether list.sort() uses an in-place merge sort (1), or a binary insertion
+// sort (0) which makes O(n^2) moves, so is slower for lists of more than a
+// few hundred items.  Both are stable.  The merge sort increases Thumb2 code
+// size by about 98 bytes.
+#ifndef MICROPY_OPT_LIST_SORT_MERGE
+#define MICROPY_OPT_LIST_SORT_MERGE (MICROPY_CONFIG_ROM_LEVEL_AT_LEAST_EXTRA_FEATURES)
+#endif
+
+// Whether list.sort()'s merge sort checks if two sorted halves are already in
+// order before merging them, which makes sorting sorted or nearly sorted lists
+// about 3x faster.  Increases Thumb2 code size by about 46 bytes.
+#ifndef MICROPY_OPT_LIST_SORT_ORDERED_CHECK
+#define MICROPY_OPT_LIST_SORT_ORDERED_CHECK (MICROPY_CONFIG_ROM_LEVEL_AT_LEAST_EXTRA_FEATURES)
+#endif
+
 // Whether math.factorial is large, fast and recursive (1) or small and slow (0).
 #ifndef MICROPY_OPT_MATH_FACTORIAL
 #define MICROPY_OPT_MATH_FACTORIAL (MICROPY_CONFIG_ROM_LEVEL_AT_LEAST_EXTRA_FEATURES)
